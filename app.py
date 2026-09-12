@@ -4,9 +4,11 @@ Web interface for refreshing .ROBLOSECURITY cookies via proxy rotation.
 """
 
 import os
+import signal
 import time
 import threading
-import traceback
+from contextlib import contextmanager
+
 from flask import Flask, render_template, request, jsonify
 
 from proxy_manager import (
@@ -19,15 +21,13 @@ from refresher import refresh_cookie, validate_cookie
 
 app = Flask(__name__)
 
-# ─── Global state ─────────────────────────────────────────
 rotator: ProxyRotator = None
 proxy_pool: list = []
 proxy_lock = threading.Lock()
 start_time = time.time()
 
-# ─── Bootstrap ────────────────────────────────────────────
+
 def boot():
-    """Load or scrape proxies on startup."""
     global rotator, proxy_pool
     proxies = load_proxies()
     if not proxies:
@@ -39,9 +39,28 @@ def boot():
     rotator = ProxyRotator(proxies, mode="round-robin")
     print(f"[boot] Loaded {len(proxies)} proxies.")
 
+
 boot()
 
-# ─── Routes ───────────────────────────────────────────────
+
+class RequestTimeout(Exception):
+    pass
+
+
+@contextmanager
+def time_limit(seconds: int):
+    """Hard wall-clock timeout via SIGALRM. Main-thread only."""
+    def handler(signum, frame):
+        raise RequestTimeout(f"timed out after {seconds}s")
+
+    old = signal.signal(signal.SIGALRM, handler)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
 
 @app.route("/")
 def index():
@@ -50,11 +69,7 @@ def index():
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
-    """
-    Accept a cookie, try to refresh it through proxy rotation.
-    Body: { "cookie": "..." }
-    """
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     cookie = (data.get("cookie") or "").strip()
 
     if not cookie:
@@ -67,61 +82,86 @@ def api_refresh():
         }), 400
 
     attempts = []
-    max_attempts = min(15, len(proxy_pool)) if proxy_pool else 5
 
-    # Try with direct connection first (no proxy)
-    new_cookie, err = refresh_cookie(cookie, proxies=None)
-    if new_cookie:
-        return jsonify({
-            "ok": True,
-            "cookie": new_cookie,
-            "method": "direct",
-            "attempts": 1,
-        })
-
-    attempts.append({"proxy": "direct", "error": err})
-
-    # Try with proxies
-    if rotator:
-        for i in range(max_attempts):
-            proxies = rotator.get()
-            proxy_label = list(proxies.values())[0] if proxies else "none"
+    try:
+        with time_limit(240):
+            # Attempt 1: direct
             try:
-                new_cookie, err = refresh_cookie(cookie, proxies=proxies)
+                new_cookie, err = refresh_cookie(cookie, proxies=None)
                 if new_cookie:
                     return jsonify({
                         "ok": True,
                         "cookie": new_cookie,
-                        "method": "proxy",
-                        "proxy": proxy_label,
-                        "attempts": i + 2,
+                        "method": "direct",
+                        "attempts": 1,
                     })
-                attempts.append({"proxy": proxy_label, "error": err})
+                attempts.append({"proxy": "direct", "error": err or "unknown"})
             except Exception as e:
-                attempts.append({"proxy": proxy_label, "error": str(e)[:80]})
+                attempts.append({"proxy": "direct", "error": str(e)[:80]})
+
+            # Attempts 2..N: through proxies
+            if rotator and proxy_pool:
+                max_attempts = min(8, len(proxy_pool))
+                for i in range(max_attempts):
+                    proxies = rotator.get()
+                    proxy_label = list(proxies.values())[0] if proxies else "none"
+                    try:
+                        new_cookie, err = refresh_cookie(cookie, proxies=proxies)
+                        if new_cookie:
+                            return jsonify({
+                                "ok": True,
+                                "cookie": new_cookie,
+                                "method": "proxy",
+                                "proxy": proxy_label,
+                                "attempts": i + 2,
+                            })
+                        attempts.append({
+                            "proxy": proxy_label,
+                            "error": err or "unknown",
+                        })
+                    except Exception as e:
+                        attempts.append({
+                            "proxy": proxy_label,
+                            "error": str(e)[:80],
+                        })
+
+    except RequestTimeout as e:
+        return jsonify({
+            "ok": False,
+            "error": f"Refresh aborted: {str(e)}",
+            "attempts": attempts[-8:],
+        }), 504
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": f"Internal error: {str(e)[:120]}",
+            "attempts": attempts[-8:],
+        }), 500
 
     return jsonify({
         "ok": False,
         "error": "All refresh attempts failed. Cookie may be invalid or proxies are dead.",
-        "attempts": attempts[-10:],  # last 10 for debugging
+        "attempts": attempts[-8:],
     }), 502
 
 
 @app.route("/api/validate", methods=["POST"])
 def api_validate():
-    """Quick cookie validity check."""
-    data = request.get_json(force=True)
+    data = request.get_json(force=True) or {}
     cookie = (data.get("cookie") or "").strip()
     if not cookie:
         return jsonify({"ok": False, "error": "No cookie."}), 400
 
-    valid = validate_cookie(cookie)
-    return jsonify({"ok": True, "valid": valid})
+    try:
+        with time_limit(30):
+            valid = validate_cookie(cookie)
+        return jsonify({"ok": True, "valid": valid})
+    except RequestTimeout:
+        return jsonify({"ok": False, "error": "Validation timed out."}), 504
 
 
 @app.route("/api/proxies", methods=["GET"])
 def api_proxies():
-    """Return proxy pool stats."""
     return jsonify({
         "total": len(proxy_pool),
         "sample": proxy_pool[:5],
@@ -130,21 +170,20 @@ def api_proxies():
 
 @app.route("/api/scrape", methods=["POST"])
 def api_scrape():
-    """Force a fresh scrape + validation."""
-    global rotator, proxy_pool
-
     def _scrape():
         global rotator, proxy_pool
-        raw = scrape_sources()
-        good = validate_proxies(raw)
-        with proxy_lock:
-            proxy_pool = good if good else raw
-            rotator = ProxyRotator(proxy_pool, mode="round-robin")
-        print(f"[scrape] {len(good)} working proxies out of {len(raw)} raw.")
+        try:
+            raw = scrape_sources()
+            good = validate_proxies(raw)
+            final = good if good else raw
+            with proxy_lock:
+                proxy_pool = final
+                rotator = ProxyRotator(proxy_pool, mode="round-robin")
+            print(f"[scrape] {len(good)} working / {len(raw)} raw.")
+        except Exception as e:
+            print(f"[scrape] failed: {e}")
 
-    thread = threading.Thread(target=_scrape, daemon=True)
-    thread.start()
-
+    threading.Thread(target=_scrape, daemon=True).start()
     return jsonify({"ok": True, "message": "Scrape started in background."})
 
 
@@ -157,7 +196,6 @@ def health():
     })
 
 
-# ─── Main ─────────────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=False)
