@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+proxy.txt
+good_proxies.txt
+scraped_proxies.txt
+.env
+venv/
+.venv/
